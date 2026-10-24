@@ -19,8 +19,13 @@ jobs:
           $pub = "C:\Users\Public"
           Copy-Item "$env:GITHUB_WORKSPACE\winprobe.ps1" "$pub\winprobe.ps1" -Force
           Remove-Item "$pub\std_out.txt","$pub\std_err.txt" -ErrorAction SilentlyContinue
-          $plain = "Ameen1!" + [guid]::NewGuid().ToString('N').Substring(0,12)
-          net user ameenstd $plain /add | Out-Null
+          $plain = "Aa1!" + [guid]::NewGuid().ToString('N').Substring(0,16) + "Zz9#"
+          $add = (net user ameenstd $plain /add /y 2>&1 | Out-String).Trim()
+          Write-Output ("net-user-add exit=$LASTEXITCODE out=[" + $add + "]")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "RESULT: CI runner refused local standard-user creation; unprivileged context not measurable here."
+            Write-Output "net localgroup Administrators:"; net localgroup Administrators
+          } else { Write-Output ("user exists: " + ((Get-LocalUser ameenstd -ErrorAction SilentlyContinue) -ne $null)) }
           $psexe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
           # Primary: Start-Process -Credential
           $sec  = ConvertTo-SecureString $plain -AsPlainText -Force
