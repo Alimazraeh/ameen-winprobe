@@ -1,0 +1,29 @@
+name: winprobe
+on: { workflow_dispatch: {}, push: { branches: [main] } }
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe as runner (default elevated context)
+        shell: pwsh
+        run: |
+          Write-Output "=== CONTEXT A: default runner account ==="
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\winprobe.ps1"
+      - name: Probe as a fresh STANDARD (non-admin) user
+        shell: pwsh
+        run: |
+          Write-Output "=== CONTEXT B: standard user, /RL LIMITED scheduled task ==="
+          $pub = "C:\Users\Public"
+          Copy-Item "$env:GITHUB_WORKSPACE\winprobe.ps1" "$pub\winprobe.ps1" -Force
+          $pw = "Ameen!" + [guid]::NewGuid().ToString('N').Substring(0,10)
+          net user ameenstd $pw /add | Out-Null
+          # ameenstd is in 'Users' only, never 'Administrators'
+          "pwsh -NoProfile -ExecutionPolicy Bypass -File ""$pub\winprobe.ps1"" > ""$pub\std_out.txt"" 2>&1" | Out-File -Encoding ascii "$pub\runstd.cmd"
+          schtasks /create /tn AmeenProbe /tr "$pub\runstd.cmd" /sc once /st 23:59 /ru ameenstd /rp $pw /rl LIMITED /f | Out-Null
+          schtasks /run /tn AmeenProbe | Out-Null
+          Start-Sleep -Seconds 45
+          if (Test-Path "$pub\std_out.txt") { Get-Content "$pub\std_out.txt" } else { Write-Output "NO OUTPUT FROM STANDARD USER" }
+          schtasks /delete /tn AmeenProbe /f | Out-Null
+          net user ameenstd /delete | Out-Null
