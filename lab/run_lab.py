@@ -16,7 +16,7 @@ PHASE = os.environ.get("LAB_PHASE", "sensors")      # sensors | trace (Linux str
 NO_PRIV = bool(os.environ.get("LAB_NO_PRIV"))
 OUT = pathlib.Path(os.environ.get("LAB_OUT", "lab_out")).resolve() / PHASE
 OUT.mkdir(parents=True, exist_ok=True)
-ROOT = pathlib.Path(tempfile.mkdtemp(prefix="ameenlab_")).resolve()
+ROOT = pathlib.Path(os.environ["LAB_ROOT"]) if os.environ.get("LAB_ROOT") else pathlib.Path(tempfile.mkdtemp(prefix="ameenlab_")).resolve()
 HOME = ROOT / "fakehome"
 PY = sys.executable
 AGENT_PID = os.getpid()
@@ -452,22 +452,39 @@ STEPS = [
  ("BN6", "benign", "-", "pure compute, touches no catalogued object", b_compute, "benign_noise"),
 ]
 
+HELPER = "import sys\nfor l in sys.stdin:\n    try: open(l.strip(), 'rb').read()\n    except Exception: pass\n    print('ok', flush=True)\n"
+
+def spawn_helper(): return subprocess.Popen([PY, "-c", HELPER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+def helper_read(h, p):
+    h.stdin.write(str(p) + "\n"); h.stdin.flush(); h.stdout.readline(); return h.pid
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--sensors": return sensor_main(sys.argv[2:])
+    if os.environ.get("LAB_ROLE") == "agent":                         # the emulated agent runs as a fresh process, started after the sensors
+        for s in STEPS: step(*s)
+        jdump(OUT / "steps.json", GT); return
     log("lab start os=%s phase=%s py=%s root=%s" % (OS, PHASE, sys.version.split()[0], ROOT))
     build_home(); jdump(OUT / "catalog.json", {"home": str(HOME), "classes": CATALOG})
-    stop = ROOT / "STOP"; sproc = None; info = {}
+    stop = ROOT / "STOP"; sproc = None; info = {}; pre = None
     if PHASE == "sensors":
+        pre = spawn_helper()                                          # control: a reader that exists BEFORE any privileged sensor starts
         sproc = subprocess.Popen([PY, os.path.abspath(__file__), "--sensors", str(HOME), str(OUT), str(stop)])
         if not NO_PRIV: info = start_priv()
         time.sleep(3.0)
     t_start = time.time()
-    for s in STEPS: step(*s)
+    ap = subprocess.Popen([PY, os.path.abspath(__file__)], env=dict(os.environ, LAB_ROLE="agent", LAB_ROOT=str(ROOT)))
+    agent_pid = ap.pid; ap.wait()
+    GT.extend(json.load(open(OUT / "steps.json")))
+    if PHASE == "sensors":
+        cred = HOME / ".aws/credentials"
+        step("CTRL1", "control", "-", "reader that already existed when the privileged sensors started", lambda: ([helper_read(pre, cred)], [cred]), "control")
+        post = spawn_helper()
+        step("CTRL2", "control", "-", "reader started after the privileged sensors", lambda: ([helper_read(post, cred)], [cred]), "control")
     time.sleep(3.0)
     if PHASE == "sensors":
         stop.write_text("stop"); time.sleep(1.5)
         if not NO_PRIV: stop_priv(info)
-    jdump(OUT / "gt.json", {"os": OS, "phase": PHASE, "agent_pid": AGENT_PID, "sensor_pid": sproc.pid if sproc else None,
+    jdump(OUT / "gt.json", {"os": OS, "phase": PHASE, "agent_pid": agent_pid, "sensor_pid": sproc.pid if sproc else None,
                             "t_start": t_start, "t_end": time.time(), "home": str(HOME), "root": str(ROOT), "py": PY, "steps": GT})
     log("lab done: %d steps, outputs in %s" % (len(GT), OUT))
 
