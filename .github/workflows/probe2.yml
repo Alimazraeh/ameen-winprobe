@@ -1,0 +1,54 @@
+name: winprobe2
+on: { workflow_dispatch: {}, push: { branches: [main] } }
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe as runner (default elevated context)
+        shell: pwsh
+        run: |
+          Write-Output "=== CONTEXT A: default runner account ==="
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\winprobe2.ps1"
+      - name: Probe as a fresh STANDARD (non-admin) user
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Output "=== CONTEXT B: standard non-admin user ==="
+          $pub = "C:\Users\Public"
+          Copy-Item "$env:GITHUB_WORKSPACE\winprobe2.ps1" "$pub\winprobe2.ps1" -Force
+          Remove-Item "$pub\std_out.txt","$pub\std_err.txt" -ErrorAction SilentlyContinue
+          $plain = "Aa1!" + [guid]::NewGuid().ToString('N').Substring(0,16) + "Zz9#"
+          $add = (net user ameenstd $plain /add /y 2>&1 | Out-String).Trim()
+          Write-Output ("net-user-add exit=$LASTEXITCODE out=[" + $add + "]")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "RESULT: CI runner refused local standard-user creation; unprivileged context not measurable here."
+            Write-Output "net localgroup Administrators:"; net localgroup Administrators
+          } else { Write-Output ("user exists: " + ((Get-LocalUser ameenstd -ErrorAction SilentlyContinue) -ne $null)) }
+          $psexe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          # Primary: Start-Process -Credential
+          $sec  = ConvertTo-SecureString $plain -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("ameenstd",$sec)
+          try {
+            Start-Process -FilePath $psexe -Credential $cred -WorkingDirectory $pub `
+              -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$pub\winprobe2.ps1" `
+              -RedirectStandardOutput "$pub\std_out.txt" -RedirectStandardError "$pub\std_err.txt" -Wait
+            Write-Output "method: Start-Process -Credential returned"
+          } catch { Write-Output ("Start-Process -Credential ERR: " + $_.Exception.Message) }
+          Start-Sleep 3
+          $got = (Test-Path "$pub\std_out.txt") -and ((Get-Item "$pub\std_out.txt").Length -gt 0)
+          if (-not $got) {
+            Write-Output "primary produced nothing; trying scheduled-task fallback"
+            "$psexe -NoProfile -ExecutionPolicy Bypass -File ""$pub\winprobe2.ps1"" > ""$pub\std_out.txt"" 2>&1" | Out-File -Encoding ascii "$pub\run.cmd"
+            schtasks /create /tn AmeenP /tr "$pub\run.cmd" /sc once /st 23:59 /ru ameenstd /rp $plain /f | Out-Null
+            schtasks /run /tn AmeenP | Out-Null
+            Start-Sleep 40
+            schtasks /query /tn AmeenP /fo list 2>&1 | Select-String "Status|Last Result"
+            schtasks /delete /tn AmeenP /f | Out-Null
+          }
+          Write-Output "--- standard-user stdout ---"
+          if (Test-Path "$pub\std_out.txt") { Get-Content "$pub\std_out.txt" } else { Write-Output "NO OUTPUT FROM STANDARD USER" }
+          if ((Test-Path "$pub\std_err.txt") -and (Get-Item "$pub\std_err.txt").Length -gt 0) { Write-Output "--- stderr ---"; Get-Content "$pub\std_err.txt" }
+          net user ameenstd /delete | Out-Null
+          exit 0

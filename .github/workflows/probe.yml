@@ -1,5 +1,5 @@
 name: winprobe
-on: { workflow_dispatch: {}, push: { branches: [main] } }
+on: { workflow_dispatch: {} }
 jobs:
   probe:
     runs-on: windows-latest
