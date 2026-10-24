@@ -27,7 +27,7 @@ try {
     $n=[Runtime.InteropServices.Marshal]::ReadInt32($buf)
     # each MIB_TCPROW_OWNER_PID = 24 bytes: state,local,localport,remote,remoteport,pid
     $withPid=0; $off=4
-    for($i=0;$i -lt $n;$i++){ $pid=[Runtime.InteropServices.Marshal]::ReadInt32($buf,$off+20); if($pid -gt 0){$withPid++}; $off+=24 }
+    for($i=0;$i -lt $n;$i++){ $op=[Runtime.InteropServices.Marshal]::ReadInt32($buf,$off+20); if($op -gt 0){$withPid++}; $off+=24 }
     M "f1_tcp_rows" $n
     M "f1_rows_with_owning_pid" $withPid
     M "f1_getextendedtcptable" "OK_unprivileged"
