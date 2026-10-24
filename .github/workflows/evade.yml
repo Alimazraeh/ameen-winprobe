@@ -1,0 +1,10 @@
+name: winevade
+on: { workflow_dispatch: {}, push: { branches: [main] } }
+jobs:
+  evade:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\winevade.ps1"
