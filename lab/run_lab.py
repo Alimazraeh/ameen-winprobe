@@ -203,32 +203,61 @@ ConvertTo-Json -InputObject @($rows) -Depth 4 -Compress | Out-File -Encoding utf
 Write-Output ("exported " + $rows.Count + " of " + @($ev).Count)
 '''
 
+def audit_rules_text():
+    lines = ["-D", "-b 32768"]
+    dirs = {HOME, HOME / "Documents", HOME / "persist/LaunchAgents", HOME / "persist/systemd-user", HOME / "persist/Startup"}
+    for rel in CATALOG:
+        f = HOME / rel; dirs.add(f.parent); lines.append("-w %s -p rwa -k decoy" % f)    # file watches log reads of the file itself
+    for d in sorted(dirs): lines.append("-w %s -p wa -k decoy_dir" % d)                     # directory watches log create/delete/rename
+    lines.append("-a always,exit -F arch=b64 -S execve -k lab_exec")
+    lines.append("-e 1")
+    return "\n".join(lines) + "\n"
+
+def start_audit_linux(info):
+    r = sudo(["apt-get", "install", "-y", "-qq", "auditd"]); info["apt_rc"] = r.returncode
+    sudo(["sed", "-i", "s/^flush *=.*/flush = SYNC/", "/etc/audit/auditd.conf"])
+    for cmd in (["systemctl", "restart", "auditd"], ["service", "auditd", "restart"]):
+        r = sudo(cmd); info["restart_" + cmd[0]] = [r.returncode, (r.stderr or "")[-160:]]
+        if r.returncode == 0: break
+    rules = ROOT / "lab.rules"; rules.write_text(audit_rules_text(), encoding="utf-8")
+    dst = "/tmp/ameen_lab.rules"
+    sudo(["cp", str(rules), dst]); sudo(["chown", "root:root", dst]); sudo(["chmod", "600", dst])
+    r = sudo(["auditctl", "-R", dst]); info["load_rules"] = [r.returncode, (r.stdout + r.stderr)[-400:]]
+    info["rule_count"] = len([l for l in sudo(["auditctl", "-l"]).stdout.splitlines() if l.strip()])
+    sp = HOME / ".aws/credentials"; subprocess.run(["cat", str(sp)], capture_output=True); time.sleep(1.0)      # self-test, before t_start
+    info["selftest_decoy_events"] = len([l for l in sudo(["ausearch", "-k", "decoy", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
+    diag = []
+    for cmd in (["cat", "/proc/cmdline"], ["ls", "-la", "/var/log/audit"], ["auditctl", "-s"],
+                ["bash", "-c", "journalctl -k --no-pager 2>/dev/null | grep -i audit | tail -15"], ["bash", "-c", "tail -n 6 /var/log/audit/audit.log"]):
+        r = sudo(cmd); diag.append("$ " + " ".join(cmd) + "\n" + (r.stdout + r.stderr)[-1500:])
+    (OUT / "audit_diag_start.txt").write_text("\n\n".join(diag), encoding="utf-8")
+
+def start_eslogger(info):
+    r = sudo(["/usr/bin/eslogger", "--list-events"]); supported = set(r.stdout.split())
+    want = ["exec", "fork", "exit", "open", "close", "create", "write", "rename", "unlink", "stat", "readdir", "mmap", "truncate",
+            "setattrlist", "utimes", "link", "clone", "copyfile", "setmode", "setowner"]
+    evs = [e for e in want if e in supported] or ["exec", "open"]
+    info["eslogger_events"] = evs; info["eslogger_supported"] = len(supported)
+    p = subprocess.Popen(["sudo", "-n", "/usr/bin/eslogger"] + evs, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+    out = open(OUT / "eslogger_filtered.jsonl", "w", encoding="utf-8"); cnt = {"total": 0, "kept": 0}
+    def pump():
+        for line in p.stdout:
+            cnt["total"] += 1
+            if "ameenlab_" in line or '"exec":' in line or '"fork":' in line or '"exit":' in line:
+                out.write(line); cnt["kept"] += 1
+        out.close()
+    th = threading.Thread(target=pump, daemon=True); th.start(); PRIV["es"] = (p, th, cnt)
+
 def start_priv():
     info = {"os": OS}
     try:
-        if OS == "Linux":
-            r = sudo(["apt-get", "install", "-y", "-qq", "auditd"]); info["apt_rc"] = r.returncode
-            for cmd in (["systemctl", "start", "auditd"], ["service", "auditd", "start"]):
-                r = sudo(cmd); info["start_" + cmd[0]] = [r.returncode, (r.stderr or "")[-160:]]
-                if r.returncode == 0: break
-            info["status_before"] = sudo(["auditctl", "-s"]).stdout[-300:]
-            sudo(["auditctl", "-D"]); sudo(["auditctl", "-b", "32768"]); sudo(["auditctl", "-e", "1"])
-            r1 = sudo(["auditctl", "-w", str(HOME), "-p", "rwa", "-k", "decoy"]); info["rule_watch"] = [r1.returncode, (r1.stderr or r1.stdout)[-200:]]
-            r2 = sudo(["auditctl", "-a", "always,exit", "-F", "arch=b64", "-S", "execve", "-F", "uid=%d" % os.getuid(), "-k", "lab_exec"])
-            info["rule_exec"] = [r2.returncode, (r2.stderr or r2.stdout)[-200:]]
-            info["rules"] = sudo(["auditctl", "-l"]).stdout
+        if OS == "Linux": start_audit_linux(info)
         elif OS == "Darwin":
             f = open(OUT / "fs_usage_raw.log", "w")
             p = subprocess.Popen(["sudo", "-n", "fs_usage", "-w", "-f", "filesys", "-f", "exec"], stdout=f, stderr=subprocess.STDOUT)
             PRIV["fsu"] = (p, f); info["fs_usage"] = "started"
-            try:
-                r = subprocess.run(["sudo", "-n", "/usr/bin/eslogger", "open"], capture_output=True, text=True, timeout=4)
-                info["eslogger"] = {"rc": r.returncode, "stderr": r.stderr[-300:], "stdout_head": r.stdout[:160]}
-            except subprocess.TimeoutExpired as e:
-                o = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode("utf-8", "replace")
-                info["eslogger"] = {"rc": "ran-until-timeout", "stdout_head": o[:160]}
-                subprocess.run(["sudo", "-n", "pkill", "eslogger"], capture_output=True)
-            except Exception as e: info["eslogger"] = {"error": str(e)}
+            try: start_eslogger(info)
+            except Exception as e: info["eslogger_error"] = repr(e)
         elif OS == "Windows":
             ps1 = OUT / "audit_setup.ps1"; ps1.write_text(PS_SETUP.replace("@@HOME@@", str(HOME)), encoding="utf-8")
             r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)], capture_output=True, text=True)
@@ -240,14 +269,21 @@ def start_priv():
 def stop_priv(info):
     try:
         if OS == "Linux":
-            for key in ("decoy", "lab_exec"):
+            for key in ("decoy", "decoy_dir", "lab_exec"):
                 for fmt, flag in (("raw", "-r"), ("int", "-i")):
                     r = sudo(["ausearch", "-k", key, flag])
                     (OUT / ("audit_%s_%s.txt" % (key, fmt))).write_text(r.stdout + ("\n#ERR " + r.stderr if r.returncode not in (0, 1) else ""), encoding="utf-8")
+            r = sudo(["cat", "/var/log/audit/audit.log"])
+            with gzip.open(str(OUT / "audit.log.gz"), "wt", encoding="utf-8") as g: g.write(r.stdout[-30_000_000:])
             (OUT / "audit_status_end.txt").write_text(sudo(["auditctl", "-s"]).stdout, encoding="utf-8")
             sudo(["auditctl", "-D"])
         elif OS == "Darwin":
             subprocess.run(["sudo", "-n", "pkill", "-f", "fs_usage"], capture_output=True)
+            subprocess.run(["sudo", "-n", "pkill", "eslogger"], capture_output=True)
+            if "es" in PRIV:
+                p, th, cnt = PRIV["es"]; th.join(15); info["eslogger_lines"] = cnt
+                try: info["eslogger_stderr"] = p.stderr.read()[-400:]
+                except Exception: pass
             p, f = PRIV.get("fsu", (None, None))
             if p:
                 try: p.wait(timeout=10)
@@ -257,9 +293,8 @@ def stop_priv(info):
             if raw.exists():
                 lines = raw.read_text(errors="replace").splitlines()
                 keep = [l for l in lines if str(ROOT) in l or " exec " in l or "posix_spawn" in l]
-                (OUT / "fs_usage.log").write_text("\n".join(keep), encoding="utf-8")
-                info["fs_usage_lines"] = [len(lines), len(keep)]
-                with open(raw, "rb") as a, gzip.open(str(raw) + ".gz", "wb") as b: shutil.copyfileobj(a, b)
+                (OUT / "fs_usage.log").write_text("\n".join(keep), encoding="utf-8"); info["fs_usage_lines"] = [len(lines), len(keep)]
+                with open(raw, "rb") as a_, gzip.open(str(raw) + ".gz", "wb") as b_: shutil.copyfileobj(a_, b_)
                 raw.unlink()
         elif OS == "Windows":
             ps1 = OUT / "audit_export.ps1"
