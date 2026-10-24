@@ -423,6 +423,46 @@ def b_app(): return [run_child([PY, str(HOME / "proj/src/app.py")])], [HOME / "p
 def b_humancat(): p = HOME / ".aws/credentials"; return [run_child(cat_argv(p))], [p]
 def b_compute(): return [run_child(pyc("sum(range(2000000))"))], []
 
+# ------------------------------------------------------------------ evasion techniques (benign: synthetic decoys only), each mapped to the layer it attacks
+def _P(rel): return HOME / rel
+def ev_mmap():                      # attacks read()-syscall watches: map the file and read via memory
+    import mmap; p = _P(".aws/credentials")
+    try:
+        with open(p, "rb") as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ); _ = bytes(mm[:32]); mm.close()
+    except Exception: open(p, "rb").read()
+    return [AGENT_PID], [p]
+def ev_rename():                    # attacks per-path watches: rename out, read, rename back
+    p = _P(".npmrc"); q = p.parent / (p.name + ".tmp")
+    try: os.rename(p, q); open(q, "rb").read(); os.rename(q, p)
+    except Exception: open(p, "rb").read()
+    return [AGENT_PID], [p]
+def ev_hardlink():                  # attacks per-path watches: read through a hardlink outside the watched tree
+    p = _P(".git-credentials"); link = ROOT / "ev_hl"
+    try: os.link(p, link); open(link, "rb").read(); os.unlink(link)
+    except Exception: open(p, "rb").read()
+    return [AGENT_PID], [p]
+def ev_fdpass():                    # attacks per-PID attribution: parent opens, child reads the inherited fd without open()
+    p = _P(".docker/config.json")
+    if not hasattr(os, "fork"):
+        return [run_child(pyc("open(%r,'rb').read()" % str(p)))], [p]
+    fd = os.open(str(p), os.O_RDONLY); pid = os.fork()
+    if pid == 0:
+        try: os.read(fd, 64)
+        finally: os._exit(0)
+    os.waitpid(pid, 0); os.close(fd); return [pid], [p]
+def ev_lol():                       # attacks the accessor allowlist: an allowlisted interpreter reads a non-allowlisted secret
+    p = _P(".ssh/id_ed25519"); return [run_child(pyc("open(%r,'rb').read()" % str(p)))], [p]
+def ev_tsrestore():                 # attacks FIM polling: modify a persistence file then restore content and timestamps
+    p = _P(".profile")
+    try:
+        st = os.stat(p); data = open(p, "rb").read()
+        with open(p, "ab") as f: f.write(b"# transient\n")
+        with open(p, "wb") as f: f.write(data)
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+    except Exception: pass
+    return [AGENT_PID], [p]
+
 STEPS = [
  ("CA1", "Credential Access", "T1552.001", "in-process read of cloud credentials", s_ca1, "attack"),
  ("CA2", "Credential Access", "T1552.004", "child process reads a private key", s_ca2, "attack"),
@@ -444,6 +484,12 @@ STEPS = [
  ("IM2", "Impact", "T1486 (emulated)", "rename 200 documents to .locked", s_im2, "attack"),
  ("IM3", "Impact", "T1485", "delete 50 documents", s_im3, "attack"),
  ("EXE1", "Execution", "T1059", "three-level process chain", s_exe1, "attack"),
+ ("EV1", "Evasion", "mmap-read", "read a secret via mmap instead of read()", ev_mmap, "evasion"),
+ ("EV2", "Evasion", "rename-read", "rename a secret out, read it, rename back (path-watch evasion)", ev_rename, "evasion"),
+ ("EV3", "Evasion", "hardlink-read", "read a secret through a hardlink outside the watched tree", ev_hardlink, "evasion"),
+ ("EV4", "Evasion", "fd-passing", "parent opens, forked child reads the inherited fd (no open by child)", ev_fdpass, "evasion"),
+ ("EV5", "Evasion", "living-off-the-land", "an allowlisted interpreter (python) reads a non-allowlisted secret", ev_lol, "evasion"),
+ ("EV6", "Evasion", "transient-write-restore", "modify a persistence file then restore content and timestamps", ev_tsrestore, "evasion"),
  ("BN1", "benign", "-", "ssh-keygen derives a public key (legitimate accessor)", b_sshkeygen, "benign_legit"),
  ("BN2", "benign", "-", "git diff reads a tracked .env (legitimate accessor)", b_gitdiff, "benign_legit"),
  ("BN3", "benign", "-", "npm reads its own npmrc (legitimate accessor)", b_npm, "benign_legit"),
