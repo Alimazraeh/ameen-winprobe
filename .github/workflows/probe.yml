@@ -14,23 +14,36 @@ jobs:
       - name: Probe as a fresh STANDARD (non-admin) user
         shell: pwsh
         run: |
-          Write-Output "=== CONTEXT B: standard user via Start-Process -Credential ==="
+          $ErrorActionPreference = 'Continue'
+          Write-Output "=== CONTEXT B: standard non-admin user ==="
           $pub = "C:\Users\Public"
           Copy-Item "$env:GITHUB_WORKSPACE\winprobe.ps1" "$pub\winprobe.ps1" -Force
-          $plain = "Ameen!" + [guid]::NewGuid().ToString('N').Substring(0,12)
+          Remove-Item "$pub\std_out.txt","$pub\std_err.txt" -ErrorAction SilentlyContinue
+          $plain = "Ameen1!" + [guid]::NewGuid().ToString('N').Substring(0,12)
           net user ameenstd $plain /add | Out-Null
-          net localgroup Users ameenstd /add 2>$null | Out-Null
+          $psexe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          # Primary: Start-Process -Credential
           $sec  = ConvertTo-SecureString $plain -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("ameenstd",$sec)
-          Write-Output ("standard user groups: " + (Get-LocalUser ameenstd | ForEach-Object { (Get-LocalGroup | Where-Object { (Get-LocalGroupMember $_.Name -ErrorAction SilentlyContinue).Name -contains "$env:COMPUTERNAME\ameenstd" }).Name -join ',' }))
-          $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
           try {
-            Start-Process -FilePath $ps `
+            Start-Process -FilePath $psexe -Credential $cred -WorkingDirectory $pub `
               -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$pub\winprobe.ps1" `
-              -Credential $cred -WorkingDirectory $pub `
               -RedirectStandardOutput "$pub\std_out.txt" -RedirectStandardError "$pub\std_err.txt" -Wait
+            Write-Output "method: Start-Process -Credential returned"
           } catch { Write-Output ("Start-Process -Credential ERR: " + $_.Exception.Message) }
-          Start-Sleep -Seconds 3
+          Start-Sleep 3
+          $got = (Test-Path "$pub\std_out.txt") -and ((Get-Item "$pub\std_out.txt").Length -gt 0)
+          if (-not $got) {
+            Write-Output "primary produced nothing; trying scheduled-task fallback"
+            "$psexe -NoProfile -ExecutionPolicy Bypass -File ""$pub\winprobe.ps1"" > ""$pub\std_out.txt"" 2>&1" | Out-File -Encoding ascii "$pub\run.cmd"
+            schtasks /create /tn AmeenP /tr "$pub\run.cmd" /sc once /st 23:59 /ru ameenstd /rp $plain /f | Out-Null
+            schtasks /run /tn AmeenP | Out-Null
+            Start-Sleep 40
+            schtasks /query /tn AmeenP /fo list 2>&1 | Select-String "Status|Last Result"
+            schtasks /delete /tn AmeenP /f | Out-Null
+          }
+          Write-Output "--- standard-user stdout ---"
           if (Test-Path "$pub\std_out.txt") { Get-Content "$pub\std_out.txt" } else { Write-Output "NO OUTPUT FROM STANDARD USER" }
           if ((Test-Path "$pub\std_err.txt") -and (Get-Item "$pub\std_err.txt").Length -gt 0) { Write-Output "--- stderr ---"; Get-Content "$pub\std_err.txt" }
           net user ameenstd /delete | Out-Null
+          exit 0
