@@ -461,10 +461,16 @@ def helper_read(h, p):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--sensors": return sensor_main(sys.argv[2:])
     if os.environ.get("LAB_ROLE") == "agent":                         # the emulated agent runs as a fresh process, started after the sensors
+        CATALOG.update(json.load(open(OUT / "catalog.json", encoding="utf-8"))["classes"])
         for s in STEPS: step(*s)
         jdump(OUT / "steps.json", GT); return
     log("lab start os=%s phase=%s py=%s root=%s" % (OS, PHASE, sys.version.split()[0], ROOT))
     build_home(); jdump(OUT / "catalog.json", {"home": str(HOME), "classes": CATALOG})
+    inodes = {}
+    for rel_, _c in CATALOG.items():
+        try: st_ = os.stat(HOME / rel_); inodes[rel_] = [st_.st_dev, st_.st_ino]
+        except Exception: pass
+    jdump(OUT / "inodes.json", inodes)                                # lets the scorer resolve auditd's relative PATH names by inode
     stop = ROOT / "STOP"; sproc = None; info = {}; pre = None
     if PHASE == "sensors":
         pre = spawn_helper()                                          # control: a reader that exists BEFORE any privileged sensor starts

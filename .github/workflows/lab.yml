@@ -9,6 +9,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        rep: [1, 2, 3]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -23,7 +24,7 @@ jobs:
           "$PY" --version
           "$PY" lab/run_lab.py
       - name: lab (Linux strace phase)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.rep == 1
         shell: bash
         env:
           LAB_OUT: lab_out
@@ -35,6 +36,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lab-${{ matrix.os }}
+          name: lab-${{ matrix.os }}-r${{ matrix.rep }}
           path: lab_out/
           retention-days: 3
