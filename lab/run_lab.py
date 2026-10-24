@@ -203,15 +203,16 @@ ConvertTo-Json -InputObject @($rows) -Depth 4 -Compress | Out-File -Encoding utf
 Write-Output ("exported " + $rows.Count + " of " + @($ev).Count)
 '''
 
-def audit_rules_text():
-    lines = ["-D", "-b 32768"]
+def audit_rule_argvs():
+    argvs = [["-D"], ["-b", "32768"]]
     dirs = {HOME, HOME / "Documents", HOME / "persist/LaunchAgents", HOME / "persist/systemd-user", HOME / "persist/Startup"}
     for rel in CATALOG:
-        f = HOME / rel; dirs.add(f.parent); lines.append("-w %s -p rwa -k decoy" % f)    # file watches log reads of the file itself
-    for d in sorted(dirs): lines.append("-w %s -p wa -k decoy_dir" % d)                     # directory watches log create/delete/rename
-    lines.append("-a always,exit -F arch=b64 -S execve -k lab_exec")
-    lines.append("-e 1")
-    return "\n".join(lines) + "\n"
+        f = HOME / rel; dirs.add(f.parent); argvs.append(["-w", str(f), "-p", "rwa", "-k", "decoy"])      # per-file inode watch: logs reads of the file itself
+    for d in sorted(dirs): argvs.append(["-w", str(d), "-p", "wa", "-k", "decoy_dir"])                      # per-directory watch: create/delete/rename of entries
+    argvs.append(["-a", "always,exit", "-F", "dir=" + str(HOME), "-F", "perm=rwa", "-k", "decoy_tree"])     # recursive tree rule, covers paths added later
+    argvs.append(["-a", "always,exit", "-F", "arch=b64", "-S", "execve", "-k", "lab_exec"])
+    argvs.append(["-e", "1"])
+    return argvs
 
 def start_audit_linux(info):
     r = sudo(["apt-get", "install", "-y", "-qq", "auditd"]); info["apt_rc"] = r.returncode
@@ -219,34 +220,37 @@ def start_audit_linux(info):
     for cmd in (["systemctl", "restart", "auditd"], ["service", "auditd", "restart"]):
         r = sudo(cmd); info["restart_" + cmd[0]] = [r.returncode, (r.stderr or "")[-160:]]
         if r.returncode == 0: break
-    rules = ROOT / "lab.rules"; rules.write_text(audit_rules_text(), encoding="utf-8")
-    dst = "/tmp/ameen_lab.rules"
-    sudo(["cp", str(rules), dst]); sudo(["chown", "root:root", dst]); sudo(["chmod", "600", dst])
-    r = sudo(["auditctl", "-R", dst]); info["load_rules"] = [r.returncode, (r.stdout + r.stderr)[-400:]]
+    failed = []; n_ok = 0                                                                                    # rules go in one argv each, so paths with spaces survive
+    for av in audit_rule_argvs():
+        r = sudo(["auditctl"] + av)
+        if r.returncode == 0: n_ok += 1
+        else: failed.append([" ".join(av)[:200], r.returncode, (r.stdout + r.stderr)[-200:]])
+    info["rules_ok"] = n_ok; info["rules_failed"] = failed[:12]
     info["rule_count"] = len([l for l in sudo(["auditctl", "-l"]).stdout.splitlines() if l.strip()])
-    sp = HOME / ".aws/credentials"; subprocess.run(["cat", str(sp)], capture_output=True); time.sleep(1.0)      # self-test, before t_start
+    subprocess.run(["cat", str(HOME / ".aws/credentials")], capture_output=True); time.sleep(1.0)              # self-test, before t_start
     info["selftest_decoy_events"] = len([l for l in sudo(["ausearch", "-k", "decoy", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
+    info["selftest_tree_events"] = len([l for l in sudo(["ausearch", "-k", "decoy_tree", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
     diag = []
-    for cmd in (["cat", "/proc/cmdline"], ["ls", "-la", "/var/log/audit"], ["auditctl", "-s"],
-                ["bash", "-c", "journalctl -k --no-pager 2>/dev/null | grep -i audit | tail -15"], ["bash", "-c", "tail -n 6 /var/log/audit/audit.log"]):
-        r = sudo(cmd); diag.append("$ " + " ".join(cmd) + "\n" + (r.stdout + r.stderr)[-1500:])
+    for cmd in (["auditctl", "-l"], ["auditctl", "-s"], ["bash", "-c", "tail -n 6 /var/log/audit/audit.log"]):
+        r = sudo(cmd); diag.append("$ " + " ".join(cmd) + "\n" + (r.stdout + r.stderr)[-2500:])
     (OUT / "audit_diag_start.txt").write_text("\n\n".join(diag), encoding="utf-8")
+
+def _es_pipeline(tag, evs, keep, drop=None):
+    errf = OUT / ("eslogger_%s.err" % tag); outf = OUT / ("eslogger_%s.jsonl" % tag)
+    cmd = "sudo -n /usr/bin/eslogger %s 2>%s | grep --line-buffered -E '%s'" % (" ".join(evs), errf, keep)
+    if drop: cmd += " | grep --line-buffered -v -E '%s'" % drop
+    cmd += " > %s" % outf
+    return subprocess.Popen(cmd, shell=True)
 
 def start_eslogger(info):
     r = sudo(["/usr/bin/eslogger", "--list-events"]); supported = set(r.stdout.split())
-    want = ["exec", "fork", "exit", "open", "close", "create", "write", "rename", "unlink", "stat", "readdir", "mmap", "truncate",
-            "setattrlist", "utimes", "link", "clone", "copyfile", "setmode", "setowner"]
-    evs = [e for e in want if e in supported] or ["exec", "open"]
-    info["eslogger_events"] = evs; info["eslogger_supported"] = len(supported)
-    p = subprocess.Popen(["sudo", "-n", "/usr/bin/eslogger"] + evs, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1)
-    out = open(OUT / "eslogger_filtered.jsonl", "w", encoding="utf-8"); cnt = {"total": 0, "kept": 0}
-    def pump():
-        for line in p.stdout:
-            cnt["total"] += 1
-            if "ameenlab_" in line or '"exec":' in line or '"fork":' in line or '"exit":' in line:
-                out.write(line); cnt["kept"] += 1
-        out.close()
-    th = threading.Thread(target=pump, daemon=True); th.start(); PRIV["es"] = (p, th, cnt)
+    core = [e for e in ["exec", "fork", "exit", "open", "create", "write", "rename", "unlink", "truncate", "utimes", "setattrlist", "link",
+                        "clone", "copyfile", "setmode", "setowner", "readlink", "setextattr", "deleteextattr", "setflags", "setacl"] if e in supported]
+    disc = [e for e in ["stat", "readdir", "getattrlist", "getextattr", "listextattr", "lookup"] if e in supported]
+    info["eslogger_core"] = core; info["eslogger_disc"] = disc; info["eslogger_supported"] = len(supported)
+    PRIV["es_core"] = _es_pipeline("core", core, 'ameenlab_|"exec":|"fork":|"exit":')                         # low volume: lab paths plus the full process lifecycle
+    PRIV["es_disc"] = _es_pipeline("disc", disc, 'ameenlab_', drop='fseventsd|mds_stores|mdworker')         # discovery calls, system noise removed natively
+    time.sleep(2.0)
 
 def start_priv():
     info = {"os": OS}
@@ -269,7 +273,7 @@ def start_priv():
 def stop_priv(info):
     try:
         if OS == "Linux":
-            for key in ("decoy", "decoy_dir", "lab_exec"):
+            for key in ("decoy", "decoy_dir", "decoy_tree", "lab_exec"):
                 for fmt, flag in (("raw", "-r"), ("int", "-i")):
                     r = sudo(["ausearch", "-k", key, flag])
                     (OUT / ("audit_%s_%s.txt" % (key, fmt))).write_text(r.stdout + ("\n#ERR " + r.stderr if r.returncode not in (0, 1) else ""), encoding="utf-8")
@@ -280,10 +284,16 @@ def stop_priv(info):
         elif OS == "Darwin":
             subprocess.run(["sudo", "-n", "pkill", "-f", "fs_usage"], capture_output=True)
             subprocess.run(["sudo", "-n", "pkill", "eslogger"], capture_output=True)
-            if "es" in PRIV:
-                p, th, cnt = PRIV["es"]; th.join(15); info["eslogger_lines"] = cnt
-                try: info["eslogger_stderr"] = p.stderr.read()[-400:]
-                except Exception: pass
+            for key in ("es_core", "es_disc"):
+                pp = PRIV.get(key)
+                if pp:
+                    try: pp.wait(timeout=20)
+                    except Exception: pp.kill()
+            for tag in ("core", "disc"):
+                fp = OUT / ("eslogger_%s.jsonl" % tag)
+                if fp.exists(): info["eslogger_%s_bytes" % tag] = fp.stat().st_size
+                ep = OUT / ("eslogger_%s.err" % tag)
+                if ep.exists(): info["eslogger_%s_stderr" % tag] = ep.read_text(errors="replace")[-300:]
             p, f = PRIV.get("fsu", (None, None))
             if p:
                 try: p.wait(timeout=10)
