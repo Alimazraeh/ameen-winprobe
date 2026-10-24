@@ -2,6 +2,8 @@
 # is observable with DOCUMENTED Win32 APIs, and at what privilege. Benign telemetry:
 # enumerate own/other processes, per-PID TCP table, and a Job-object process list.
 $ErrorActionPreference = 'Continue'
+# Ameen: ensure writable TEMP so Add-Type (C# compile) works for a fresh standard user
+try { $t = "C:\Users\Public\ ameentmp".Replace(" ",""); New-Item -ItemType Directory -Force -Path $t | Out-Null; $env:TEMP=$t; $env:TMP=$t } catch {}
 function M($k,$v){ Write-Output ("MEASURED`t{0}`t{1}" -f $k,$v) }
 
 # --- privilege context -------------------------------------------------------
