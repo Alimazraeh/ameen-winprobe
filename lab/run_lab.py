@@ -228,29 +228,46 @@ def start_audit_linux(info):
     info["rules_ok"] = n_ok; info["rules_failed"] = failed[:12]
     info["rule_count"] = len([l for l in sudo(["auditctl", "-l"]).stdout.splitlines() if l.strip()])
     subprocess.run(["cat", str(HOME / ".aws/credentials")], capture_output=True); time.sleep(1.0)              # self-test, before t_start
-    info["selftest_decoy_events"] = len([l for l in sudo(["ausearch", "-k", "decoy", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
-    info["selftest_tree_events"] = len([l for l in sudo(["ausearch", "-k", "decoy_tree", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
+    info["selftest_decoy_events"] = len([l for l in sudo(["ausearch", "--input-logs", "-k", "decoy", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
+    info["selftest_tree_events"] = len([l for l in sudo(["ausearch", "--input-logs", "-k", "decoy_tree", "-r"]).stdout.splitlines() if "type=SYSCALL" in l])
     diag = []
     for cmd in (["auditctl", "-l"], ["auditctl", "-s"], ["bash", "-c", "tail -n 6 /var/log/audit/audit.log"]):
         r = sudo(cmd); diag.append("$ " + " ".join(cmd) + "\n" + (r.stdout + r.stderr)[-2500:])
     (OUT / "audit_diag_start.txt").write_text("\n\n".join(diag), encoding="utf-8")
 
-def _es_pipeline(tag, evs, keep, drop=None):
-    errf = OUT / ("eslogger_%s.err" % tag); outf = OUT / ("eslogger_%s.jsonl" % tag)
-    cmd = "sudo -n /usr/bin/eslogger %s 2>%s | grep --line-buffered -E '%s'" % (" ".join(evs), errf, keep)
-    if drop: cmd += " | grep --line-buffered -v -E '%s'" % drop
-    cmd += " > %s" % outf
-    return subprocess.Popen(cmd, shell=True)
+ES_GROUPS = {   # one eslogger client per group, so a burst in one group cannot starve the others (each client has its own queue)
+    "open": ["open"],
+    "mutate": ["create", "write", "rename", "unlink", "truncate", "utimes", "setattrlist", "link", "clone", "copyfile", "setmode", "setowner",
+               "setextattr", "deleteextattr", "setflags", "setacl", "readlink"],
+    "life": ["exec", "fork", "exit"],
+    "disc": ["stat", "readdir", "getattrlist", "getextattr", "listextattr", "lookup"],
+}
+ES_AWK = r"""{
+  n++
+  if (match($0, /"global_seq_num" *: *[0-9]+/)) { t = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", t); v = t + 0; if (v > mx) mx = v }
+  if (KEEPALL == "1" || (index($0, "ameenlab_") && $0 !~ /fseventsd|mds_stores|mdworker/)) { print $0 > OUTF; fflush(OUTF) }
+}
+END { print n + 0, mx + 0 > STATF }
+"""
 
 def start_eslogger(info):
     r = sudo(["/usr/bin/eslogger", "--list-events"]); supported = set(r.stdout.split())
-    core = [e for e in ["exec", "fork", "exit", "open", "create", "write", "rename", "unlink", "truncate", "utimes", "setattrlist", "link",
-                        "clone", "copyfile", "setmode", "setowner", "readlink", "setextattr", "deleteextattr", "setflags", "setacl"] if e in supported]
-    disc = [e for e in ["stat", "readdir", "getattrlist", "getextattr", "listextattr", "lookup"] if e in supported]
-    info["eslogger_core"] = core; info["eslogger_disc"] = disc; info["eslogger_supported"] = len(supported)
-    PRIV["es_core"] = _es_pipeline("core", core, 'ameenlab_|"exec":|"fork":|"exit":')                         # low volume: lab paths plus the full process lifecycle
-    PRIV["es_disc"] = _es_pipeline("disc", disc, 'ameenlab_', drop='fseventsd|mds_stores|mdworker')         # discovery calls, system noise removed natively
-    time.sleep(2.0)
+    (OUT / "es_filter.awk").write_text(ES_AWK, encoding="utf-8"); info["eslogger_groups"] = {}; PRIV["es"] = {}
+    for tag, evs in ES_GROUPS.items():
+        evs = [e for e in evs if e in supported]
+        if not evs: continue
+        info["eslogger_groups"][tag] = evs
+        outf, statf, errf = OUT / ("eslogger_%s.jsonl" % tag), OUT / ("eslogger_%s.stats" % tag), OUT / ("eslogger_%s.err" % tag)
+        cmd = "sudo -n /usr/bin/eslogger %s 2>%s | awk -v OUTF=%s -v STATF=%s -v KEEPALL=%s -f %s" % (
+            " ".join(evs), errf, outf, statf, "1" if tag == "life" else "0", OUT / "es_filter.awk")
+        PRIV["es"][tag] = subprocess.Popen(cmd, shell=True)
+    probe = ROOT / ".es_probe"; probe.write_text("x", encoding="utf-8"); t0 = time.time(); ready = {}
+    while time.time() - t0 < 60 and len(ready) < len(PRIV["es"]):                         # eslogger needs seconds to attach: probe until each client has seen us
+        open(probe).read(); os.utime(probe, None); os.stat(probe); subprocess.run(["/usr/bin/true"]); time.sleep(0.5)
+        for tag in PRIV["es"]:
+            f = OUT / ("eslogger_%s.jsonl" % tag)
+            if tag not in ready and f.exists() and f.stat().st_size > 0: ready[tag] = round(time.time() - t0, 1)
+    info["eslogger_ready_after_s"] = ready; info["eslogger_not_ready"] = [t for t in PRIV["es"] if t not in ready]
 
 def start_priv():
     info = {"os": OS}
@@ -275,7 +292,7 @@ def stop_priv(info):
         if OS == "Linux":
             for key in ("decoy", "decoy_dir", "decoy_tree", "lab_exec"):
                 for fmt, flag in (("raw", "-r"), ("int", "-i")):
-                    r = sudo(["ausearch", "-k", key, flag])
+                    r = sudo(["ausearch", "--input-logs", "-k", key, flag])
                     (OUT / ("audit_%s_%s.txt" % (key, fmt))).write_text(r.stdout + ("\n#ERR " + r.stderr if r.returncode not in (0, 1) else ""), encoding="utf-8")
             r = sudo(["cat", "/var/log/audit/audit.log"])
             with gzip.open(str(OUT / "audit.log.gz"), "wt", encoding="utf-8") as g: g.write(r.stdout[-30_000_000:])
@@ -284,16 +301,13 @@ def stop_priv(info):
         elif OS == "Darwin":
             subprocess.run(["sudo", "-n", "pkill", "-f", "fs_usage"], capture_output=True)
             subprocess.run(["sudo", "-n", "pkill", "eslogger"], capture_output=True)
-            for key in ("es_core", "es_disc"):
-                pp = PRIV.get(key)
-                if pp:
-                    try: pp.wait(timeout=20)
-                    except Exception: pp.kill()
-            for tag in ("core", "disc"):
-                fp = OUT / ("eslogger_%s.jsonl" % tag)
-                if fp.exists(): info["eslogger_%s_bytes" % tag] = fp.stat().st_size
+            for tag, pp in PRIV.get("es", {}).items():
+                try: pp.wait(timeout=20)
+                except Exception: pp.kill()
+                st = OUT / ("eslogger_%s.stats" % tag)
+                if st.exists(): info["eslogger_%s_total_maxseq" % tag] = st.read_text().split()
                 ep = OUT / ("eslogger_%s.err" % tag)
-                if ep.exists(): info["eslogger_%s_stderr" % tag] = ep.read_text(errors="replace")[-300:]
+                if ep.exists() and ep.stat().st_size: info["eslogger_%s_stderr" % tag] = ep.read_text(errors="replace")[-300:]
             p, f = PRIV.get("fsu", (None, None))
             if p:
                 try: p.wait(timeout=10)
